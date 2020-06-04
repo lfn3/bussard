@@ -1,4 +1,3 @@
-use futures::Future;
 use http::header::HeaderMap;
 use http::Method;
 use pyo3::prelude::{pyclass, pymethods, PyObject, PyResult, Python};
@@ -7,54 +6,59 @@ use pyo3::{
     PyCell,
 };
 use pyo3::{PyAny, PyTryInto};
-use std::{collections::HashMap, env, task::Poll};
+use std::{cell::RefCell, collections::HashMap, env, rc::Rc};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::{join, task};
 use warp::{filters::header::headers_cloned, Filter, Rejection};
 
-fn add_per_request_environ(
-    py: Python,
-    req: BussardRequest,
-) -> &PyDict {
-    let environ = base_environ();
-    let py_env = environ
-        .iter()
-        .map(|(k, v)| (k, PyString::new(py, v)))
+fn add_per_request_environ(py: Python, req: BussardRequest) -> PyResult<&PyDict> {
+    let str_env_vars = vec![
+        ("wsgi.url_scheme", "http"),
+        ("HTTP_HOST", "localhost"),
+        ("REQUEST_METHOD", req.method.as_str()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()));
+
+    let with_external_env = env::vars().into_iter().chain(str_env_vars);
+
+    let py_env = with_external_env
+        .map(|(k, v)| (k, PyString::new(py, v.as_str())))
         .into_py_dict(py);
 
-    py_env
-        .set_item("REQUEST_METHOD", req.method.as_str())
-        .unwrap();
+    py_env.set_item("wsgi.version", PyTuple::new(py, vec![1, 0]))?;
+    py_env.set_item("wsgi.run_once", false)?;
 
-    py_env
+    Ok(py_env)
 }
 
 #[pyclass]
+#[derive(Clone)]
 struct StartResponse {
-    headers: Box<Option<HashMap<String, String>>>,
+    headers: Rc<RefCell<Option<HashMap<String, String>>>>,
 }
 
 #[pymethods]
 impl StartResponse {
     #[call]
     #[args(args = "*")]
-    fn __call__(&mut self, args: &PyTuple) {
-        println!("Start response called with {}", args);
-        let header_map = HashMap::new();
-        self.headers.replace(header_map);
+    fn __call__(&mut self, py: Python, args: &PyTuple) {
+        // TODO: This function is _super_ unsafe
+        let status_str: &str = args.get_item(0).extract().unwrap();
+        let headers_list: Vec<(&str, &str)> = args.get_item(1).extract().unwrap();
+
+        let header_map = headers_list
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        self.headers.replace(Some(header_map));
     }
 }
 
-impl Future for StartResponse {
-    type Output = HashMap<String, String>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        match *self.headers.clone() {
-            Some(headers) => Poll::Ready(headers),
-            None => Poll::Pending,
+impl StartResponse {
+    fn new() -> StartResponse {
+        StartResponse {
+            headers: Rc::new(RefCell::new(Option::None)),
         }
     }
 }
@@ -71,49 +75,49 @@ struct AsyncBussardRequest {
     resp_sender: Sender<Vec<u8>>,
 }
 
-fn base_environ() -> HashMap<String, String> {
-    let wsgi_env_vars = vec![("wsgi.url_scheme", "http"), ("HTTP_HOST", "localhost")]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()));
-    env::vars().into_iter().chain(wsgi_env_vars).collect()
+fn invoke_app_py<'a>(
+    py: Python,
+    app: &'a PyAny,
+    req: BussardRequest,
+    sr: StartResponse,
+) -> PyResult<&'a PyAny> {
+    let full_environ: &PyAny = add_per_request_environ(py, req)?.into();
+    let py_sr = PyCell::new(py, sr)?;
+    let args = PyTuple::new(py, vec![full_environ, py_sr]);
+    app.call1(args)
 }
 
 fn invoke_app<'a>(
     py: Python,
     app: &'a PyAny,
     req: BussardRequest,
-) -> PyResult<&'a PyAny> {
-    let full_environ: &PyAny = add_per_request_environ(py, req).into();
-    let sr = StartResponse {
-        headers: Box::new(Option::None),
-    };
-    let py_sr = PyCell::new(py, sr).unwrap();
-    let args = PyTuple::new(py, vec![full_environ, py_sr]);
-    let resp = app.call1(args);
-    println!("{:?}", resp);
-    return resp;
+) -> (PyResult<&'a PyAny>, HashMap<String, String>) {
+    let sr = StartResponse::new();
+    let result = invoke_app_py(py, app, req, sr.clone());
+    (result, sr.headers.replace(None).unwrap())
 }
 
-async fn bussard(
-    receiver: &mut Receiver<AsyncBussardRequest>,
-) {
+async fn bussard(receiver: &mut Receiver<AsyncBussardRequest>) {
     let gil = Python::acquire_gil();
     let py = gil.python();
     let app = flaskapp(py).unwrap();
 
     loop {
         match receiver.recv().await {
-            Some(mut req) => match invoke_app(py, app, req.req) {
-                Ok(resp) => {
-                    req.resp_sender
-                        .send(format!("{}", resp).into_bytes())
-                        .await
-                        .unwrap();
+            Some(mut req) => {
+                let (resp, headers) = invoke_app(py, app, req.req);
+                match resp {
+                    Ok(resp) => {
+                        req.resp_sender
+                            .send(format!("{}", resp).into_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        e.print_and_set_sys_last_vars(py);
+                    }
                 }
-                Err(e) => {
-                    e.print_and_set_sys_last_vars(py);
-                }
-            },
+            }
             None => {
                 break;
             }
@@ -170,7 +174,7 @@ async fn main() {
 
 fn add_paths(py: Python) -> PyResult<()> {
     let syspath: &PyList = py.import("sys")?.get("path")?.try_into()?;
-    
+
     let mut cwd = env::current_dir().unwrap();
     cwd.push("src");
     syspath.insert(0, cwd.to_str())?;
@@ -198,30 +202,22 @@ mod tests {
 
     use crate::{flaskapp, invoke_app, BussardRequest};
     use http::{HeaderMap, Method};
-    use pyo3::{Python};
+    use pyo3::{PyResult, Python};
 
     #[test]
-    fn test_sync_wsgi() {
+    fn test_sync_wsgi() -> PyResult<()> {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let app = flaskapp(py).map_err(|e| {
-            // We can't display python error type via ::std::fmt::Display,
-            // so print error here manually.
-            e.print_and_set_sys_last_vars(py);
-        }).unwrap();
+        let app = flaskapp(py)?;
 
         let req = BussardRequest {
             header_map: HeaderMap::new(),
             method: Method::GET,
         };
-        let resp = invoke_app(py, app, req)
-            .map_err(|e| {
-                // We can't display python error type via ::std::fmt::Display,
-                // so print error here manually.
-                e.print_and_set_sys_last_vars(py);
-            })
-            .unwrap();
+        let (res, headers) = invoke_app(py, app, req);
+        res?;
+        println!("headers: {:?}", headers);
 
-        println!("{}", resp);
+        Ok(())
     }
 }
