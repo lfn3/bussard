@@ -1,5 +1,5 @@
 [package]
-name = "rust-python"
+name = "bussard"
 version = "0.1.0"
 authors = ["lfn3 <liam@lfn3.net>"]
 edition = "2018"
