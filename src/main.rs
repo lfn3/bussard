@@ -170,11 +170,16 @@ async fn main() {
 
 fn add_paths(py: Python) -> PyResult<()> {
     let syspath: &PyList = py.import("sys")?.get("path")?.try_into()?;
+    
+    let mut cwd = env::current_dir().unwrap();
+    cwd.push("src");
+    syspath.insert(0, cwd.to_str())?;
 
-    let module_path = "C:\\Users\\Liam\\sources\\rust-python\\src";
-    syspath.insert(0, module_path)?;
-    let venv_path = "C:\\Users\\Liam\\sources\\rust-python\\.venv\\Lib\\site-packages";
-    syspath.insert(1, venv_path)?;
+    cwd.pop();
+    cwd.push(".venv");
+    cwd.push("Lib");
+    cwd.push("site-packages");
+    syspath.insert(1, cwd.to_str())?;
 
     Ok(())
 }
@@ -193,13 +198,17 @@ mod tests {
 
     use crate::{flaskapp, invoke_app, BussardRequest};
     use http::{HeaderMap, Method};
-    use pyo3::Python;
+    use pyo3::{Python};
 
     #[test]
     fn test_sync_wsgi() {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let app = flaskapp(py).unwrap();
+        let app = flaskapp(py).map_err(|e| {
+            // We can't display python error type via ::std::fmt::Display,
+            // so print error here manually.
+            e.print_and_set_sys_last_vars(py);
+        }).unwrap();
 
         let req = BussardRequest {
             header_map: HeaderMap::new(),
@@ -213,6 +222,6 @@ mod tests {
             })
             .unwrap();
 
-        println!("{}", resp)
+        println!("{}", resp);
     }
 }
