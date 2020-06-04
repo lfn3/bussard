@@ -14,9 +14,9 @@ use warp::{filters::header::headers_cloned, Filter, Rejection};
 
 fn add_per_request_environ(
     py: Python,
-    environ: HashMap<String, String>,
     req: BussardRequest,
 ) -> &PyDict {
+    let environ = base_environ();
     let py_env = environ
         .iter()
         .map(|(k, v)| (k, PyString::new(py, v)))
@@ -81,10 +81,9 @@ fn base_environ() -> HashMap<String, String> {
 fn invoke_app<'a>(
     py: Python,
     app: &'a PyAny,
-    base_environ: HashMap<String, String>,
     req: BussardRequest,
 ) -> PyResult<&'a PyAny> {
-    let full_environ: &PyAny = add_per_request_environ(py, base_environ, req).into();
+    let full_environ: &PyAny = add_per_request_environ(py, req).into();
     let sr = StartResponse {
         headers: Box::new(Option::None),
     };
@@ -96,7 +95,6 @@ fn invoke_app<'a>(
 }
 
 async fn bussard(
-    base_environ: HashMap<String, String>,
     receiver: &mut Receiver<AsyncBussardRequest>,
 ) {
     let gil = Python::acquire_gil();
@@ -105,7 +103,7 @@ async fn bussard(
 
     loop {
         match receiver.recv().await {
-            Some(mut req) => match invoke_app(py, app, base_environ.clone(), req.req) {
+            Some(mut req) => match invoke_app(py, app, req.req) {
                 Ok(resp) => {
                     req.resp_sender
                         .send(format!("{}", resp).into_bytes())
@@ -155,9 +153,8 @@ async fn dispatch_req(
 async fn main() {
     let mut ch = channel::<AsyncBussardRequest>(1024);
     let receiver: &mut Receiver<AsyncBussardRequest> = &mut ch.1;
-    let environ = base_environ();
     // We block in place so we don't have to send the python bits
-    let bussard = task::block_in_place(move || bussard(environ, receiver));
+    let bussard = task::block_in_place(move || bussard(receiver));
 
     let bussarded = warp::any()
         .and(headers_cloned())
@@ -194,7 +191,7 @@ fn flaskapp(py: Python) -> PyResult<&PyAny> {
 #[cfg(test)]
 mod tests {
 
-    use crate::{base_environ, flaskapp, invoke_app, BussardRequest};
+    use crate::{flaskapp, invoke_app, BussardRequest};
     use http::{HeaderMap, Method};
     use pyo3::Python;
 
@@ -208,8 +205,7 @@ mod tests {
             header_map: HeaderMap::new(),
             method: Method::GET,
         };
-        let base_environ = base_environ();
-        let resp = invoke_app(py, app, base_environ, req)
+        let resp = invoke_app(py, app, req)
             .map_err(|e| {
                 // We can't display python error type via ::std::fmt::Display,
                 // so print error here manually.
