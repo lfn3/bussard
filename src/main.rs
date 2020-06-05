@@ -1,5 +1,6 @@
-use http::header::HeaderMap;
-use http::Method;
+use http::header::{HeaderMap, HeaderName, HeaderValue, InvalidHeaderName, InvalidHeaderValue};
+use http::{response::Builder, Method};
+use hyper;
 use pyo3::prelude::{pyclass, pymethods, PyObject, PyResult, Python};
 use pyo3::{
     types::{IntoPyDict, PyDict, PyList, PyString, PyTuple},
@@ -7,7 +8,7 @@ use pyo3::{
 };
 use pyo3::{PyAny, PyTryInto};
 use std::{cell::RefCell, collections::HashMap, env, rc::Rc};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::{mpsc, oneshot};
 use tokio::{join, task};
 use warp::{filters::header::headers_cloned, Filter, Rejection};
 
@@ -72,7 +73,8 @@ struct BussardRequest {
 #[derive(Debug)]
 struct AsyncBussardRequest {
     req: BussardRequest,
-    resp_sender: Sender<Vec<u8>>,
+    resp_sender: mpsc::Sender<Vec<u8>>,
+    headers_sender: oneshot::Sender<HashMap<String, String>>,
 }
 
 fn invoke_app_py<'a>(
@@ -97,7 +99,7 @@ fn invoke_app<'a>(
     (result, sr.headers.replace(None).unwrap())
 }
 
-async fn bussard(receiver: &mut Receiver<AsyncBussardRequest>) {
+async fn bussard(receiver: &mut mpsc::Receiver<AsyncBussardRequest>) {
     let gil = Python::acquire_gil();
     let py = gil.python();
     let app = flaskapp(py).unwrap();
@@ -108,6 +110,8 @@ async fn bussard(receiver: &mut Receiver<AsyncBussardRequest>) {
                 let (resp, headers) = invoke_app(py, app, req.req);
                 match resp {
                     Ok(resp) => {
+                        req.headers_sender.send(headers).unwrap();
+
                         req.resp_sender
                             .send(format!("{}", resp).into_bytes())
                             .await
@@ -135,41 +139,62 @@ fn build_req(header_map: HeaderMap, method: Method) -> BussardRequest {
     BussardRequest { header_map, method }
 }
 
-fn build_async_req(req: BussardRequest, resp_sender: Sender<Vec<u8>>) -> AsyncBussardRequest {
-    AsyncBussardRequest { req, resp_sender }
+fn build_async_req(
+    req: BussardRequest,
+    resp_sender: mpsc::Sender<Vec<u8>>,
+    headers_sender: oneshot::Sender<HashMap<String, String>>,
+) -> AsyncBussardRequest {
+    AsyncBussardRequest {
+        req,
+        resp_sender,
+        headers_sender,
+    }
+}
+
+fn normalize_headers(headers: HashMap<String, String>) -> Result<HeaderMap, Rejection> {
+    let normalized_names: Result<Vec<(HeaderName, String)>, InvalidHeaderName> = headers
+        .into_iter()
+        .map(|(k, v)| HeaderName::from_bytes(k.into_bytes().as_slice()).map(|hn| (hn, v)))
+        .collect();
+    let normalized_values: Result<HashMap<HeaderName, HeaderValue>, InvalidHeaderValue> =
+        normalized_names
+            .unwrap()
+            .into_iter()
+            .map(|(hn, v)| HeaderValue::from_bytes(v.into_bytes().as_slice()).map(|hv| (hn, hv)))
+            .collect();
+    let unwrapped = normalized_values.unwrap();
+
+    let mut hm = HeaderMap::with_capacity(unwrapped.len());
+    hm.extend(unwrapped);
+    Ok(hm)
 }
 
 async fn dispatch_req(
     header_map: HeaderMap,
     method: Method,
-    mut sender: Sender<AsyncBussardRequest>,
-) -> Result<Vec<u8>, Rejection> {
+    mut sender: mpsc::Sender<AsyncBussardRequest>,
+) -> Result<http::Response<hyper::Body>, Rejection> {
     let req = build_req(header_map, method);
-    let ch = channel::<Vec<u8>>(16);
-    let resp_sender = ch.0;
-    let mut resp_reciever = ch.1;
-    let aync_req = build_async_req(req, resp_sender);
+
+    let resp_ch = mpsc::channel::<Vec<u8>>(16);
+    let resp_sender = resp_ch.0;
+    let mut resp_reciever = resp_ch.1;
+
+    let headers_ch = oneshot::channel::<HashMap<String, String>>();
+    let headers_sender = headers_ch.0;
+    let headers_reciever = headers_ch.1;
+
+    let aync_req = build_async_req(req, resp_sender, headers_sender);
     sender.send(aync_req).await.unwrap();
-    Ok(resp_reciever.recv().await.unwrap())
-}
+    resp_reciever.recv().await.unwrap();
 
-#[tokio::main]
-async fn main() {
-    let mut ch = channel::<AsyncBussardRequest>(1024);
-    let receiver: &mut Receiver<AsyncBussardRequest> = &mut ch.1;
-    // We block in place so we don't have to send the python bits
-    let bussard = task::block_in_place(move || bussard(receiver));
+    let (body_sender, resp_body) = hyper::Body::channel();
+    let headers = normalize_headers(headers_reciever.await.unwrap())?;
 
-    let bussarded = warp::any()
-        .and(headers_cloned())
-        .and(warp::method())
-        .and(with(ch.0))
-        .and_then(dispatch_req);
+    let mut builder = Builder::new();
+    builder.headers_mut().unwrap().extend(headers.into_iter());
 
-    let server = warp::serve(bussarded).run(([127, 0, 0, 1], 3030));
-    //.then(|x| { ch.1.close(); ready(()) }); // TODO: this, but we've already handed off the reciever
-
-    join!(bussard, server);
+    Ok(builder.body(resp_body).unwrap())
 }
 
 fn add_paths(py: Python) -> PyResult<()> {
@@ -195,6 +220,25 @@ fn flaskapp(py: Python) -> PyResult<&PyAny> {
     let flask_app = flask_main.get("make_app")?.call0()?;
 
     Ok(flask_app)
+}
+
+#[tokio::main]
+async fn main() {
+    let mut ch = mpsc::channel::<AsyncBussardRequest>(1024);
+    let receiver: &mut mpsc::Receiver<AsyncBussardRequest> = &mut ch.1;
+    // We block in place so we don't have to send the python bits
+    let bussard = task::block_in_place(move || bussard(receiver));
+
+    let bussarded = warp::any()
+        .and(headers_cloned())
+        .and(warp::method())
+        .and(with(ch.0))
+        .and_then(dispatch_req);
+
+    let server = warp::serve(bussarded).run(([127, 0, 0, 1], 3030));
+    //.then(|x| { ch.1.close(); ready(()) }); // TODO: this, but we've already handed off the reciever
+
+    join!(bussard, server);
 }
 
 #[cfg(test)]
