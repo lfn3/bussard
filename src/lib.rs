@@ -114,14 +114,15 @@ where
                     Ok(resp) => {
                         req.headers_sender.send(headers).unwrap();
 
-                        let iter = resp.call_method0("__iter__").unwrap();
-                        let body_bytes: Vec<u8> =
-                            iter.call_method0("__next__").unwrap().extract().unwrap();
-
-                        req.resp_sender
-                            .send_data(Bytes::from(body_bytes))
-                            .await
-                            .unwrap();
+                        let bytes_iter = resp.iter().unwrap()
+                            .map(|b| b.and_then(PyAny::extract::<Vec<u8>>));
+                        
+                        for byte_vec in bytes_iter {
+                            let bytes = Bytes::from(byte_vec.unwrap());
+                            req.resp_sender.send_data(bytes)
+                                .await
+                                .unwrap()
+                        }
                     }
                     Err(e) => {
                         e.print_and_set_sys_last_vars(py);
