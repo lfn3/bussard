@@ -198,7 +198,7 @@ mod tests {
     use crate::{invoke_app, BussardRequest};
     use http::{HeaderMap, Method};
     use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python};
-    use std::env;
+    use std::{str::from_utf8, env};
 
     fn add_paths(py: Python) -> PyResult<()> {
         let syspath: &PyList = py.import("sys")?.get("path")?.try_into()?;
@@ -235,9 +235,18 @@ mod tests {
             header_map: HeaderMap::new(),
             method: Method::GET,
         };
-        let (res, headers) = invoke_app(py, app, req);
-        res?;
-        println!("headers: {:?}", headers);
+        let (res, headers) = invoke_app(py, app, req);   
+        assert_eq!(headers.get("Content-Length").unwrap(), "13");
+
+        let body: Vec<Vec<u8>> = res?.iter()?
+            .collect::<PyResult<Vec<&PyAny>>>()?.into_iter()
+            .map(PyAny::extract::<Vec<u8>>)
+            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+
+        assert_eq!(body.len(), 1);
+        
+        let first_as_str = from_utf8(body[0].as_slice()).unwrap();
+        assert_eq!(first_as_str, "Hello, World!");
 
         Ok(())
     }
