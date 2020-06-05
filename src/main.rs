@@ -1,6 +1,6 @@
 use http::header::{HeaderMap, HeaderName, HeaderValue, InvalidHeaderName, InvalidHeaderValue};
 use http::{response::Builder, Method};
-use hyper;
+use hyper::{self, body::Bytes, };
 use pyo3::prelude::{pyclass, pymethods, PyObject, PyResult, Python};
 use pyo3::{
     types::{IntoPyDict, PyDict, PyList, PyString, PyTuple},
@@ -73,7 +73,7 @@ struct BussardRequest {
 #[derive(Debug)]
 struct AsyncBussardRequest {
     req: BussardRequest,
-    resp_sender: mpsc::Sender<Vec<u8>>,
+    resp_sender: hyper::body::Sender,
     headers_sender: oneshot::Sender<HashMap<String, String>>,
 }
 
@@ -113,7 +113,7 @@ async fn bussard(receiver: &mut mpsc::Receiver<AsyncBussardRequest>) {
                         req.headers_sender.send(headers).unwrap();
 
                         req.resp_sender
-                            .send(format!("{}", resp).into_bytes())
+                            .send_data(Bytes::from(format!("Hello. Full body is: <pre><code>{}</code></pre>", resp)))
                             .await
                             .unwrap();
                     }
@@ -141,7 +141,7 @@ fn build_req(header_map: HeaderMap, method: Method) -> BussardRequest {
 
 fn build_async_req(
     req: BussardRequest,
-    resp_sender: mpsc::Sender<Vec<u8>>,
+    resp_sender: hyper::body::Sender,
     headers_sender: oneshot::Sender<HashMap<String, String>>,
 ) -> AsyncBussardRequest {
     AsyncBussardRequest {
@@ -175,20 +175,15 @@ async fn dispatch_req(
     mut sender: mpsc::Sender<AsyncBussardRequest>,
 ) -> Result<http::Response<hyper::Body>, Rejection> {
     let req = build_req(header_map, method);
-
-    let resp_ch = mpsc::channel::<Vec<u8>>(16);
-    let resp_sender = resp_ch.0;
-    let mut resp_reciever = resp_ch.1;
+    let (body_sender, resp_body) = hyper::Body::channel();
 
     let headers_ch = oneshot::channel::<HashMap<String, String>>();
     let headers_sender = headers_ch.0;
     let headers_reciever = headers_ch.1;
 
-    let aync_req = build_async_req(req, resp_sender, headers_sender);
+    let aync_req = build_async_req(req, body_sender, headers_sender);
     sender.send(aync_req).await.unwrap();
-    resp_reciever.recv().await.unwrap();
 
-    let (body_sender, resp_body) = hyper::Body::channel();
     let headers = normalize_headers(headers_reciever.await.unwrap())?;
 
     let mut builder = Builder::new();
