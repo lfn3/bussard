@@ -112,8 +112,11 @@ async fn bussard(receiver: &mut mpsc::Receiver<AsyncBussardRequest>) {
                     Ok(resp) => {
                         req.headers_sender.send(headers).unwrap();
 
+                        let iter = resp.call_method0("__iter__").unwrap();
+                        let body_bytes: Vec<u8> = iter.call_method0("__next__").unwrap().extract().unwrap();
+
                         req.resp_sender
-                            .send_data(Bytes::from(format!("Hello. Full body is: <pre><code>{}</code></pre>", resp)))
+                            .send_data(Bytes::from(body_bytes))
                             .await
                             .unwrap();
                     }
