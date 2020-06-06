@@ -46,6 +46,7 @@ async fn main() {
     let bussard = task::block_in_place(move || bussard(receiver, flaskapp));
 
     let bussarded = warp::any()
+        .and(warp::path::tail())
         .and(headers_cloned())
         .and(warp::method())
         .and(warp::body::bytes())

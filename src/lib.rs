@@ -9,7 +9,7 @@ use pyo3::{
 };
 use std::{cell::RefCell, collections::HashMap, env, fmt::Debug, rc::Rc, cmp::max};
 use tokio::sync::{mpsc, oneshot};
-use warp::Rejection;
+use warp::{path::Tail, Rejection};
 
 fn add_per_request_environ<'py>(py: Python<'py>, req: BussardRequest) -> PyResult<&'py PyDict> {
     let str_env_vars = vec![
@@ -26,11 +26,13 @@ fn add_per_request_environ<'py>(py: Python<'py>, req: BussardRequest) -> PyResul
         .map(|(k, v)| (k, PyString::new(py, v.as_str())))
         .into_py_dict(py);
 
-    py_env.set_item("wsgi.version", PyTuple::new(py, vec![1, 0]))?;
-    py_env.set_item("wsgi.run_once", false)?;
+    py_env.set_item("PATH_INFO", req.path.as_str())?;
     py_env.set_item("CONTENT_LENGTH", req.body.len())?;
+
     let py_req: PyObject = req.into_py(py);
     py_env.set_item("wsgi.input", py_req)?;
+    py_env.set_item("wsgi.version", PyTuple::new(py, vec![1, 0]))?;
+    py_env.set_item("wsgi.run_once", false)?;
 
     Ok(py_env)
 }
@@ -69,6 +71,7 @@ impl StartResponse {
 #[pyclass]
 #[derive(Debug)]
 pub struct BussardRequest {
+    path: String,
     header_map: HeaderMap,
     method: Method,
     body: Bytes,
@@ -167,8 +170,9 @@ where
     }
 }
 
-fn build_req(header_map: HeaderMap, method: Method, body: Bytes) -> BussardRequest {
+fn build_req(path: String, header_map: HeaderMap, method: Method, body: Bytes) -> BussardRequest {
     BussardRequest {
+        path,
         header_map,
         method,
         body,
@@ -207,12 +211,14 @@ fn normalize_headers(headers: HashMap<String, String>) -> Result<HeaderMap, Reje
 }
 
 pub async fn dispatch_req<'body>(
+    path: Tail,
     header_map: HeaderMap,
     method: Method,
     body: Bytes,
     mut sender: mpsc::Sender<AsyncBussardRequest>,
 ) -> Result<http::Response<hyper::Body>, Rejection> {
-    let req = build_req(header_map, method, body);
+    let path = path.as_str().to_owned();
+    let req = build_req(path, header_map, method, body);
     let (body_sender, body) = hyper::Body::channel();
 
     let (headers_sender, headers_reciever) = oneshot::channel::<HashMap<String, String>>();
@@ -268,7 +274,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py)?;
 
-        let req = build_req(HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
+        let req = build_req("".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
         let (res, headers) = invoke_app(py, app, req)?;
         assert_eq!(headers.get("Content-Length").unwrap(), "13");
 
@@ -293,7 +299,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
 
-        let req = build_req(HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
+        let req = build_req("/echo".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
         let (res, headers) = invoke_app(py, app, req)?;
         assert_eq!(headers.get("Content-Length").unwrap(), "4");
 

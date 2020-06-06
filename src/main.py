@@ -9,7 +9,7 @@ def make_app() -> Flask:
     def hello_world():
         return 'Hello, World!'
 
-    @app.route('/', methods=['POST'])
+    @app.route('/echo', methods=['POST'])
     def echo():
         return request.get_data()
 
