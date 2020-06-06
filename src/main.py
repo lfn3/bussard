@@ -1,13 +1,17 @@
-from flask import Flask
+from flask import Flask, request
 import pandas as pd
 
 
 def make_app() -> Flask:
     app = Flask(__name__)
 
-    @app.route('/')
+    @app.route('/', methods=['GET'])
     def hello_world():
         return 'Hello, World!'
+
+    @app.route('/', methods=['POST'])
+    def echo():
+        return request.get_data()
 
     return app
 

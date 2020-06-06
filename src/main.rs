@@ -48,6 +48,7 @@ async fn main() {
     let bussarded = warp::any()
         .and(headers_cloned())
         .and(warp::method())
+        .and(warp::body::bytes())
         .and(with(ch.0))
         .and_then(dispatch_req);
 

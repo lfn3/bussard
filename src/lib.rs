@@ -5,13 +5,13 @@ use pyo3::prelude::{pyclass, pymethods, PyObject, PyResult, Python};
 use pyo3::PyAny;
 use pyo3::{
     types::{IntoPyDict, PyDict, PyString, PyTuple},
-    PyCell,
+    PyCell, IntoPy,
 };
-use std::{cell::RefCell, collections::HashMap, env, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, env, fmt::Debug, rc::Rc, cmp::max};
 use tokio::sync::{mpsc, oneshot};
 use warp::Rejection;
 
-fn add_per_request_environ(py: Python, req: BussardRequest) -> PyResult<&PyDict> {
+fn add_per_request_environ<'py>(py: Python<'py>, req: BussardRequest) -> PyResult<&'py PyDict> {
     let str_env_vars = vec![
         ("wsgi.url_scheme", "http"),
         ("HTTP_HOST", "localhost"),
@@ -28,6 +28,9 @@ fn add_per_request_environ(py: Python, req: BussardRequest) -> PyResult<&PyDict>
 
     py_env.set_item("wsgi.version", PyTuple::new(py, vec![1, 0]))?;
     py_env.set_item("wsgi.run_once", false)?;
+    py_env.set_item("CONTENT_LENGTH", req.body.len())?;
+    let py_req: PyObject = req.into_py(py);
+    py_env.set_item("wsgi.input", py_req)?;
 
     Ok(py_env)
 }
@@ -63,10 +66,36 @@ impl StartResponse {
     }
 }
 
+#[pyclass]
 #[derive(Debug)]
 pub struct BussardRequest {
     header_map: HeaderMap,
     method: Method,
+    body: Bytes,
+    _index: usize
+}
+
+#[pymethods]
+impl BussardRequest {
+    fn read(&mut self, size: Option<usize>) -> &[u8] {
+        let start = self._index;
+        let remaining = self.body.len() - start;
+        let to_get = max(remaining, size.unwrap_or(0));
+        
+        if to_get == 0 {
+            return &[];
+        }
+
+        let result = self.body.get(start..start + to_get).unwrap();
+
+        self._index += to_get;
+
+        result
+    }
+
+    fn readline(&mut self, size: Option<usize>) -> &[u8] {
+        self.read(size) //TODO: actually split on newlines
+    }
 }
 
 #[derive(Debug)]
@@ -115,7 +144,7 @@ async fn send_resp<'body_sender>(
     Ok(())
 }
 
-pub async fn bussard<C>(receiver: &mut mpsc::Receiver<AsyncBussardRequest>, app_ctor: C)
+pub async fn bussard<'body, C>(receiver: &mut mpsc::Receiver<AsyncBussardRequest>, app_ctor: C)
 where
     C: FnOnce(Python) -> PyResult<&PyAny>,
 {
@@ -138,8 +167,13 @@ where
     }
 }
 
-fn build_req(header_map: HeaderMap, method: Method) -> BussardRequest {
-    BussardRequest { header_map, method }
+fn build_req(header_map: HeaderMap, method: Method, body: Bytes) -> BussardRequest {
+    BussardRequest {
+        header_map,
+        method,
+        body,
+        _index: 0
+    }
 }
 
 fn build_async_req(
@@ -172,12 +206,13 @@ fn normalize_headers(headers: HashMap<String, String>) -> Result<HeaderMap, Reje
     Ok(hm)
 }
 
-pub async fn dispatch_req(
+pub async fn dispatch_req<'body>(
     header_map: HeaderMap,
     method: Method,
+    body: Bytes,
     mut sender: mpsc::Sender<AsyncBussardRequest>,
 ) -> Result<http::Response<hyper::Body>, Rejection> {
-    let req = build_req(header_map, method);
+    let req = build_req(header_map, method, body);
     let (body_sender, body) = hyper::Body::channel();
 
     let (headers_sender, headers_reciever) = oneshot::channel::<HashMap<String, String>>();
@@ -196,8 +231,9 @@ pub async fn dispatch_req(
 #[cfg(test)]
 mod tests {
 
-    use crate::{invoke_app, BussardRequest};
+    use crate::{invoke_app, build_req};
     use http::{HeaderMap, Method};
+    use hyper::body::Bytes;
     use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python};
     use std::{env, str::from_utf8};
 
@@ -232,10 +268,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py)?;
 
-        let req = BussardRequest {
-            header_map: HeaderMap::new(),
-            method: Method::GET,
-        };
+        let req = build_req(HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
         let (res, headers) = invoke_app(py, app, req)?;
         assert_eq!(headers.get("Content-Length").unwrap(), "13");
 
@@ -250,6 +283,31 @@ mod tests {
 
         let first_as_str = from_utf8(body[0].as_slice()).unwrap();
         assert_eq!(first_as_str, "Hello, World!");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_post() -> PyResult<()> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
+
+        let req = build_req(HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
+        let (res, headers) = invoke_app(py, app, req)?;
+        assert_eq!(headers.get("Content-Length").unwrap(), "4");
+
+        let body: Vec<Vec<u8>> = res
+            .iter()?
+            .collect::<PyResult<Vec<&PyAny>>>()?
+            .into_iter()
+            .map(PyAny::extract::<Vec<u8>>)
+            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+
+        assert_eq!(body.len(), 1);
+
+        let first_as_str = from_utf8(body[0].as_slice()).unwrap();
+        assert_eq!(first_as_str, "ping");
 
         Ok(())
     }
