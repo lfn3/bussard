@@ -72,7 +72,7 @@ pub struct BussardRequest {
 #[derive(Debug)]
 pub struct AsyncBussardRequest {
     req: BussardRequest,
-    resp_sender: hyper::body::Sender,
+    body_sender: hyper::body::Sender,
     headers_sender: oneshot::Sender<HashMap<String, String>>,
 }
 
@@ -92,10 +92,27 @@ fn invoke_app<'a>(
     py: Python,
     app: &'a PyAny,
     req: BussardRequest,
-) -> (PyResult<&'a PyAny>, HashMap<String, String>) {
+) -> PyResult<(&'a PyAny, HashMap<String, String>)> {
     let sr = StartResponse::new();
-    let result = invoke_app_py(py, app, req, sr.clone());
-    (result, sr.headers.replace(None).unwrap())
+    let result = invoke_app_py(py, app, req, sr.clone())?;
+    Ok((result, sr.headers.replace(None).unwrap()))
+}
+
+async fn send_resp<'body_sender>(
+    body_sender: &mut hyper::body::Sender,
+    headers_sender: oneshot::Sender<HashMap<String, String>>,
+    resp: PyResult<(&PyAny, HashMap<String, String>)>,
+) -> PyResult<()> {
+    let (body, headers) = resp?;
+    let bytes_iter = body.iter()?.map(|b| b.and_then(PyAny::extract::<Vec<u8>>));
+
+    headers_sender.send(headers).unwrap();
+    for byte_vec in bytes_iter {
+        let bytes = Bytes::from(byte_vec?);
+        body_sender.send_data(bytes).await.unwrap()
+    }
+
+    Ok(())
 }
 
 pub async fn bussard<C>(receiver: &mut mpsc::Receiver<AsyncBussardRequest>, app_ctor: C)
@@ -109,25 +126,10 @@ where
     loop {
         match receiver.recv().await {
             Some(mut req) => {
-                let (resp, headers) = invoke_app(py, app, req.req);
-                match resp {
-                    Ok(resp) => {
-                        req.headers_sender.send(headers).unwrap();
-
-                        let bytes_iter = resp.iter().unwrap()
-                            .map(|b| b.and_then(PyAny::extract::<Vec<u8>>));
-                        
-                        for byte_vec in bytes_iter {
-                            let bytes = Bytes::from(byte_vec.unwrap());
-                            req.resp_sender.send_data(bytes)
-                                .await
-                                .unwrap()
-                        }
-                    }
-                    Err(e) => {
-                        e.print_and_set_sys_last_vars(py);
-                    }
-                }
+                let resp = invoke_app(py, app, req.req);
+                send_resp(&mut req.body_sender, req.headers_sender, resp)
+                    .await
+                    .unwrap();
             }
             None => {
                 break;
@@ -147,7 +149,7 @@ fn build_async_req(
 ) -> AsyncBussardRequest {
     AsyncBussardRequest {
         req,
-        resp_sender,
+        body_sender: resp_sender,
         headers_sender,
     }
 }
@@ -176,11 +178,9 @@ pub async fn dispatch_req(
     mut sender: mpsc::Sender<AsyncBussardRequest>,
 ) -> Result<http::Response<hyper::Body>, Rejection> {
     let req = build_req(header_map, method);
-    let (body_sender, resp_body) = hyper::Body::channel();
+    let (body_sender, body) = hyper::Body::channel();
 
-    let headers_ch = oneshot::channel::<HashMap<String, String>>();
-    let headers_sender = headers_ch.0;
-    let headers_reciever = headers_ch.1;
+    let (headers_sender, headers_reciever) = oneshot::channel::<HashMap<String, String>>();
 
     let aync_req = build_async_req(req, body_sender, headers_sender);
     sender.send(aync_req).await.unwrap();
@@ -190,7 +190,7 @@ pub async fn dispatch_req(
     let mut builder = Builder::new();
     builder.headers_mut().unwrap().extend(headers.into_iter());
 
-    Ok(builder.body(resp_body).unwrap())
+    Ok(builder.body(body).unwrap())
 }
 
 #[cfg(test)]
@@ -199,7 +199,7 @@ mod tests {
     use crate::{invoke_app, BussardRequest};
     use http::{HeaderMap, Method};
     use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python};
-    use std::{str::from_utf8, env};
+    use std::{env, str::from_utf8};
 
     fn add_paths(py: Python) -> PyResult<()> {
         let syspath: &PyList = py.import("sys")?.get("path")?.try_into()?;
@@ -236,16 +236,18 @@ mod tests {
             header_map: HeaderMap::new(),
             method: Method::GET,
         };
-        let (res, headers) = invoke_app(py, app, req);   
+        let (res, headers) = invoke_app(py, app, req)?;
         assert_eq!(headers.get("Content-Length").unwrap(), "13");
 
-        let body: Vec<Vec<u8>> = res?.iter()?
-            .collect::<PyResult<Vec<&PyAny>>>()?.into_iter()
+        let body: Vec<Vec<u8>> = res
+            .iter()?
+            .collect::<PyResult<Vec<&PyAny>>>()?
+            .into_iter()
             .map(PyAny::extract::<Vec<u8>>)
             .collect::<PyResult<Vec<Vec<u8>>>>()?;
 
         assert_eq!(body.len(), 1);
-        
+
         let first_as_str = from_utf8(body[0].as_slice()).unwrap();
         assert_eq!(first_as_str, "Hello, World!");
 
