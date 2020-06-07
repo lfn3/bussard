@@ -120,11 +120,37 @@ impl BussardRequest {
     }
 }
 
+impl BussardRequest {
+    fn new(path: String, header_map: HeaderMap, method: Method, body: Bytes) -> BussardRequest {
+        BussardRequest {
+            path,
+            header_map,
+            method,
+            body,
+            _index: 0
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AsyncBussardRequest {
     req: BussardRequest,
     body_sender: hyper::body::Sender,
     response_prelude_sender: oneshot::Sender<ResponsePrelude>,
+}
+
+impl AsyncBussardRequest {
+    fn new(
+        req: BussardRequest,
+        body_sender: hyper::body::Sender,
+        response_prelude_sender: oneshot::Sender<ResponsePrelude>,
+    ) -> AsyncBussardRequest {
+        AsyncBussardRequest {
+            req,
+            body_sender,
+            response_prelude_sender,
+        }
+    }
 }
 
 fn invoke_app_py<'a>(
@@ -189,28 +215,6 @@ where
     }
 }
 
-fn build_req(path: String, header_map: HeaderMap, method: Method, body: Bytes) -> BussardRequest {
-    BussardRequest {
-        path,
-        header_map,
-        method,
-        body,
-        _index: 0
-    }
-}
-
-fn build_async_req(
-    req: BussardRequest,
-    body_sender: hyper::body::Sender,
-    response_prelude_sender: oneshot::Sender<ResponsePrelude>,
-) -> AsyncBussardRequest {
-    AsyncBussardRequest {
-        req,
-        body_sender,
-        response_prelude_sender,
-    }
-}
-
 fn normalize_headers(headers: Vec<(&str, &str)>) -> Result<HeaderMap, Rejection> {
     let normalized_names: Result<Vec<(HeaderName, &str)>, InvalidHeaderName> = headers
         .into_iter()
@@ -229,7 +233,7 @@ fn normalize_headers(headers: Vec<(&str, &str)>) -> Result<HeaderMap, Rejection>
     Ok(hm)
 }
 
-pub async fn dispatch_req<'body>(
+pub async fn dispatch_req(
     path: Tail,
     header_map: HeaderMap,
     method: Method,
@@ -237,12 +241,12 @@ pub async fn dispatch_req<'body>(
     mut sender: mpsc::Sender<AsyncBussardRequest>,
 ) -> Result<http::Response<hyper::Body>, Rejection> {
     let path = path.as_str().to_owned();
-    let req = build_req(path, header_map, method, body);
+    let req = BussardRequest::new(path, header_map, method, body);
     let (body_sender, body) = hyper::Body::channel();
 
     let (response_prelude_sender, response_prelude_reciever) = oneshot::channel::<ResponsePrelude>();
 
-    let aync_req = build_async_req(req, body_sender, response_prelude_sender);
+    let aync_req = AsyncBussardRequest::new(req, body_sender, response_prelude_sender);
     sender.send(aync_req).await.unwrap();
 
     let response_prelude = response_prelude_reciever.await.unwrap();
@@ -255,7 +259,7 @@ pub async fn dispatch_req<'body>(
 #[cfg(test)]
 mod tests {
 
-    use crate::{invoke_app, build_req, StartResponse, ResponsePrelude};
+    use crate::{invoke_app, StartResponse, ResponsePrelude, BussardRequest};
     use http::{HeaderMap, Method};
     use hyper::body::Bytes;
     use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python};
@@ -292,7 +296,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py)?;
 
-        let req = build_req("".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
+        let req = BussardRequest::new("".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
         let (res, response_prelude) = invoke_app(py, app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "13");
 
@@ -317,7 +321,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py)?;
 
-        let req = build_req("/echo".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
+        let req = BussardRequest::new("/echo".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
         let (res, response_prelude) = invoke_app(py, app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "4");
 
@@ -342,7 +346,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py)?;
 
-        let req = build_req("/404".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static(&[]));
+        let req = BussardRequest::new("/404".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static(&[]));
         let (res, response_prelude) = invoke_app(py, app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "232");
         assert_eq!(response_prelude.status_code,  hyper::http::StatusCode::NOT_FOUND);
@@ -369,7 +373,7 @@ mod tests {
         let py = gil.python();
         let app = flaskapp(py)?;
 
-        let req = build_req("/throw".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
+        let req = BussardRequest::new("/throw".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
         let (res, response_prelude) = invoke_app(py, app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "290");
         assert_eq!(response_prelude.status_code,  hyper::http::StatusCode::INTERNAL_SERVER_ERROR);
