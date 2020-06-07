@@ -42,31 +42,45 @@ fn add_per_request_environ<'py>(py: Python<'py>, req: BussardRequest) -> PyResul
 #[pyclass]
 #[derive(Clone)]
 struct StartResponse {
-    headers: Rc<RefCell<Option<HashMap<String, String>>>>,
+    response_prelude: Rc<RefCell<Option<ResponsePrelude>>>
+}
+
+#[derive(Debug)]
+struct ResponsePrelude {
+    status_code: hyper::http::StatusCode,
+    headers: hyper::http::HeaderMap
 }
 
 #[pymethods]
 impl StartResponse {
     #[call]
-    #[args(args = "*")]
-    fn __call__(&mut self, args: &PyTuple) {
-        // TODO: This function is _super_ unsafe
-        let _status_str: &str = args.get_item(0).extract().unwrap(); // TODO: use this
-        let headers_list: Vec<(&str, &str)> = args.get_item(1).extract().unwrap();
+    fn __call__(&mut self, status: &str, response_headers: Vec<(&str, &str)>, _exc_info: Option<&PyTuple>) {
+        // TODO: handle exc_info, replacing headers.
 
-        let header_map = headers_list
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        self.headers.replace(Some(header_map));
+        if self.clone().has_already_been_set_or_cannot_borrow() {
+            return; //TODO: raise exception instead?
+        }
+
+        // TODO: error handling
+        let headers = normalize_headers(response_headers).unwrap();
+        let status_code: hyper::http::StatusCode = status.split(' ').nth(0)
+                                                            .and_then(|s| str::parse::<u16>(s).ok())
+                                                            .and_then(|u| hyper::http::StatusCode::from_u16(u).ok()).unwrap();
+        let response_prelude = ResponsePrelude{headers, status_code};
+             
+        self.response_prelude.replace(Some(response_prelude));
     }
 }
 
 impl StartResponse {
     fn new() -> StartResponse {
         StartResponse {
-            headers: Rc::new(RefCell::new(Option::None)),
+            response_prelude: Rc::new(RefCell::new(Option::None)),
         }
+    }
+
+    fn has_already_been_set_or_cannot_borrow(self) -> bool {
+        self.response_prelude.try_borrow().map(|r| r.is_some()).unwrap_or(false)
     }
 }
 
@@ -109,7 +123,7 @@ impl BussardRequest {
 pub struct AsyncBussardRequest {
     req: BussardRequest,
     body_sender: hyper::body::Sender,
-    headers_sender: oneshot::Sender<HashMap<String, String>>,
+    response_prelude_sender: oneshot::Sender<ResponsePrelude>,
 }
 
 fn invoke_app_py<'a>(
@@ -128,21 +142,21 @@ fn invoke_app<'a>(
     py: Python,
     app: &'a PyAny,
     req: BussardRequest,
-) -> PyResult<(&'a PyAny, HashMap<String, String>)> {
+) -> PyResult<(&'a PyAny, ResponsePrelude)> {
     let sr = StartResponse::new();
     let result = invoke_app_py(py, app, req, sr.clone())?;
-    Ok((result, sr.headers.replace(None).unwrap()))
+    Ok((result, sr.response_prelude.replace(None).unwrap()))
 }
 
 async fn send_resp<'body_sender>(
     body_sender: &mut hyper::body::Sender,
-    headers_sender: oneshot::Sender<HashMap<String, String>>,
-    resp: PyResult<(&PyAny, HashMap<String, String>)>,
+    response_prelude_sender: oneshot::Sender<ResponsePrelude>,
+    resp: PyResult<(&PyAny, ResponsePrelude)>,
 ) -> PyResult<()> {
     let (body, headers) = resp?;
     let bytes_iter = body.iter()?.map(|b| b.and_then(PyAny::extract::<Vec<u8>>));
 
-    headers_sender.send(headers).unwrap();
+    response_prelude_sender.send(headers).unwrap();
     for byte_vec in bytes_iter {
         let bytes = Bytes::from(byte_vec?);
         body_sender.send_data(bytes).await.unwrap()
@@ -163,7 +177,7 @@ where
         match receiver.recv().await {
             Some(mut req) => {
                 let resp = invoke_app(py, app, req.req);
-                send_resp(&mut req.body_sender, req.headers_sender, resp)
+                send_resp(&mut req.body_sender, req.response_prelude_sender, resp)
                     .await
                     .unwrap();
             }
@@ -186,26 +200,26 @@ fn build_req(path: String, header_map: HeaderMap, method: Method, body: Bytes) -
 
 fn build_async_req(
     req: BussardRequest,
-    resp_sender: hyper::body::Sender,
-    headers_sender: oneshot::Sender<HashMap<String, String>>,
+    body_sender: hyper::body::Sender,
+    response_prelude_sender: oneshot::Sender<ResponsePrelude>,
 ) -> AsyncBussardRequest {
     AsyncBussardRequest {
         req,
-        body_sender: resp_sender,
-        headers_sender,
+        body_sender,
+        response_prelude_sender,
     }
 }
 
-fn normalize_headers(headers: HashMap<String, String>) -> Result<HeaderMap, Rejection> {
-    let normalized_names: Result<Vec<(HeaderName, String)>, InvalidHeaderName> = headers
+fn normalize_headers(headers: Vec<(&str, &str)>) -> Result<HeaderMap, Rejection> {
+    let normalized_names: Result<Vec<(HeaderName, &str)>, InvalidHeaderName> = headers
         .into_iter()
-        .map(|(k, v)| HeaderName::from_bytes(k.into_bytes().as_slice()).map(|hn| (hn, v)))
+        .map(|(k, v)| HeaderName::from_bytes(k.as_bytes()).map(|hn| (hn, v)))
         .collect();
     let normalized_values: Result<HashMap<HeaderName, HeaderValue>, InvalidHeaderValue> =
         normalized_names
             .unwrap()
             .into_iter()
-            .map(|(hn, v)| HeaderValue::from_bytes(v.into_bytes().as_slice()).map(|hv| (hn, hv)))
+            .map(|(hn, v)| HeaderValue::from_bytes(v.as_bytes()).map(|hv| (hn, hv)))
             .collect();
     let unwrapped = normalized_values.unwrap();
 
@@ -225,23 +239,22 @@ pub async fn dispatch_req<'body>(
     let req = build_req(path, header_map, method, body);
     let (body_sender, body) = hyper::Body::channel();
 
-    let (headers_sender, headers_reciever) = oneshot::channel::<HashMap<String, String>>();
+    let (response_prelude_sender, response_prelude_reciever) = oneshot::channel::<ResponsePrelude>();
 
-    let aync_req = build_async_req(req, body_sender, headers_sender);
+    let aync_req = build_async_req(req, body_sender, response_prelude_sender);
     sender.send(aync_req).await.unwrap();
 
-    let headers = normalize_headers(headers_reciever.await.unwrap())?;
+    let response_prelude = response_prelude_reciever.await.unwrap();
 
-    let mut builder = Builder::new();
-    builder.headers_mut().unwrap().extend(headers.into_iter());
-
+    let mut builder = Builder::new().status(response_prelude.status_code);
+    builder.headers_mut().unwrap().extend(response_prelude.headers.into_iter());
     Ok(builder.body(body).unwrap())
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::{invoke_app, build_req};
+    use crate::{invoke_app, build_req, StartResponse, ResponsePrelude};
     use http::{HeaderMap, Method};
     use hyper::body::Bytes;
     use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python};
@@ -279,8 +292,8 @@ mod tests {
         let app = flaskapp(py)?;
 
         let req = build_req("".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
-        let (res, headers) = invoke_app(py, app, req)?;
-        assert_eq!(headers.get("Content-Length").unwrap(), "13");
+        let (res, response_prelude) = invoke_app(py, app, req)?;
+        assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "13");
 
         let body: Vec<Vec<u8>> = res
             .iter()?
@@ -304,8 +317,8 @@ mod tests {
         let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
 
         let req = build_req("/echo".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
-        let (res, headers) = invoke_app(py, app, req)?;
-        assert_eq!(headers.get("Content-Length").unwrap(), "4");
+        let (res, response_prelude) = invoke_app(py, app, req)?;
+        assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "4");
 
         let body: Vec<Vec<u8>> = res
             .iter()?
@@ -329,8 +342,9 @@ mod tests {
         let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
 
         let req = build_req("/404".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static(&[]));
-        let (res, headers) = invoke_app(py, app, req)?;
-        assert_eq!(headers.get("Content-Length").unwrap(), "232");
+        let (res, response_prelude) = invoke_app(py, app, req)?;
+        assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "232");
+        assert_eq!(response_prelude.status_code,  hyper::http::StatusCode::NOT_FOUND);
 
         let body: Vec<Vec<u8>> = res
             .iter()?
@@ -345,5 +359,18 @@ mod tests {
         assert!(first_as_str.contains("<title>404 Not Found</title>"));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_has_already_been_set_or_cannot_borrow_for_unused_start_response() {
+        assert!(!StartResponse::new().has_already_been_set_or_cannot_borrow())
+    }
+
+    #[test]
+    fn test_has_already_been_set_or_cannot_borrow_for_used_start_response() {
+        let sr = StartResponse::new();
+        let prelude = ResponsePrelude{headers: HeaderMap::new(), status_code: hyper::http::StatusCode::OK};
+        sr.response_prelude.replace(Some(prelude));
+        assert!(sr.has_already_been_set_or_cannot_borrow())
     }
 }
