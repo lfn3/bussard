@@ -13,6 +13,10 @@ def make_app() -> Flask:
     def echo():
         return request.get_data()
 
+    @app.route('/throw')
+    def throw():
+        raise ValueError()
+
     return app
 
 

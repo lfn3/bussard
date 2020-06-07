@@ -315,7 +315,7 @@ mod tests {
     fn test_post() -> PyResult<()> {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
+        let app = flaskapp(py)?;
 
         let req = build_req("/echo".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
         let (res, response_prelude) = invoke_app(py, app, req)?;
@@ -340,7 +340,7 @@ mod tests {
     fn test_404() -> PyResult<()> {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
+        let app = flaskapp(py)?;
 
         let req = build_req("/404".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static(&[]));
         let (res, response_prelude) = invoke_app(py, app, req)?;
@@ -358,6 +358,33 @@ mod tests {
 
         let first_as_str = from_utf8(body[0].as_slice()).unwrap();
         assert!(first_as_str.contains("<title>404 Not Found</title>"));
+
+        Ok(())
+    }
+
+    
+    #[test]
+    fn test_error() -> PyResult<()> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let app = flaskapp(py)?;
+
+        let req = build_req("/throw".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
+        let (res, response_prelude) = invoke_app(py, app, req)?;
+        assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "290");
+        assert_eq!(response_prelude.status_code,  hyper::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body: Vec<Vec<u8>> = res
+            .iter()?
+            .collect::<PyResult<Vec<&PyAny>>>()?
+            .into_iter()
+            .map(PyAny::extract::<Vec<u8>>)
+            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+
+        assert_eq!(body.len(), 1);
+
+        let first_as_str = from_utf8(body[0].as_slice()).unwrap();
+        assert!(first_as_str.contains("<title>500 Internal Server Error</title>"));
 
         Ok(())
     }
