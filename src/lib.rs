@@ -83,6 +83,8 @@ pub struct BussardRequest {
 #[pymethods]
 impl BussardRequest {
     fn read(&mut self, size: Option<usize>) -> &[u8] {
+        // TODO: test this - I don't trust it.
+        
         let start = self._index;
         let remaining = self.body.len() - start;
         let to_get = max(remaining, size.unwrap_or(0));
@@ -316,6 +318,31 @@ mod tests {
 
         let first_as_str = from_utf8(body[0].as_slice()).unwrap();
         assert_eq!(first_as_str, "ping");
+
+        Ok(())
+    }
+    
+    #[test]
+    fn test_404() -> PyResult<()> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let app = flaskapp(py).map_err(|e| { e.print_and_set_sys_last_vars(py) }).unwrap();
+
+        let req = build_req("/404".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static(&[]));
+        let (res, headers) = invoke_app(py, app, req)?;
+        assert_eq!(headers.get("Content-Length").unwrap(), "232");
+
+        let body: Vec<Vec<u8>> = res
+            .iter()?
+            .collect::<PyResult<Vec<&PyAny>>>()?
+            .into_iter()
+            .map(PyAny::extract::<Vec<u8>>)
+            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+
+        assert_eq!(body.len(), 1);
+
+        let first_as_str = from_utf8(body[0].as_slice()).unwrap();
+        assert!(first_as_str.contains("<title>404 Not Found</title>"));
 
         Ok(())
     }
