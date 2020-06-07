@@ -54,20 +54,21 @@ struct ResponsePrelude {
 #[pymethods]
 impl StartResponse {
     #[call]
-    fn __call__(&mut self, status: &str, response_headers: Vec<(&str, &str)>, _exc_info: Option<&PyTuple>) {
+    fn __call__(&self, py: Python, status: &str, response_headers: Vec<(&str, &str)>, _exc_info: Option<&PyTuple>) {
         // TODO: handle exc_info, replacing headers.
-
-        if self.clone().has_already_been_set_or_cannot_borrow() {
+        if self.has_already_been_set_or_cannot_borrow() {
             return; //TODO: raise exception instead?
         }
 
-        // TODO: error handling
-        let headers = normalize_headers(response_headers).unwrap();
-        let status_code: hyper::http::StatusCode = status.split(' ').nth(0)
-                                                            .and_then(|s| str::parse::<u16>(s).ok())
-                                                            .and_then(|u| hyper::http::StatusCode::from_u16(u).ok()).unwrap();
-        let response_prelude = ResponsePrelude{headers, status_code};
-             
+        let response_prelude = py.allow_threads(move || {
+            // TODO: error handling
+            let headers = normalize_headers(response_headers).unwrap();
+            let status_code: hyper::http::StatusCode = status.split(' ').nth(0)
+                                                                .and_then(|s| str::parse::<u16>(s).ok())
+                                                                .and_then(|u| hyper::http::StatusCode::from_u16(u).ok()).unwrap();
+            ResponsePrelude{headers, status_code}
+        });
+
         self.response_prelude.replace(Some(response_prelude));
     }
 }
@@ -79,7 +80,7 @@ impl StartResponse {
         }
     }
 
-    fn has_already_been_set_or_cannot_borrow(self) -> bool {
+    fn has_already_been_set_or_cannot_borrow(&self) -> bool {
         self.response_prelude.try_borrow().map(|r| r.is_some()).unwrap_or(false)
     }
 }
