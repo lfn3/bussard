@@ -26,7 +26,9 @@ fn add_per_request_environ<'py>(py: Python<'py>, req: BussardRequest) -> PyResul
         .map(|(k, v)| (k, PyString::new(py, v.as_str())))
         .into_py_dict(py);
 
-    py_env.set_item("PATH_INFO", req.path.as_str())?;
+    if !req.path.is_empty() {
+        py_env.set_item("PATH_INFO", req.path.as_str())?;
+    }
     py_env.set_item("CONTENT_LENGTH", req.body.len())?;
 
     let py_req: PyObject = req.into_py(py);
