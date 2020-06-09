@@ -153,6 +153,12 @@ impl AsyncBussardRequest {
     }
 }
 
+#[derive(Debug)]
+pub enum BussardMessage {
+    Request(AsyncBussardRequest),
+    Shutdown
+}
+
 fn invoke_app_py<'a>(
     py: Python,
     app: &'a PyAny,
@@ -192,7 +198,7 @@ async fn send_resp<'body_sender>(
     Ok(())
 }
 
-pub async fn bussard<'body, C>(receiver: &mut mpsc::Receiver<AsyncBussardRequest>, app_ctor: C)
+pub async fn bussard<'body, C>(receiver: &mut mpsc::Receiver<BussardMessage>, app_ctor: C)
 where
     C: FnOnce(Python) -> PyResult<&PyAny>,
 {
@@ -202,11 +208,18 @@ where
 
     loop {
         match receiver.recv().await {
-            Some(mut req) => {
-                let resp = invoke_app(py, app, req.req);
-                send_resp(&mut req.body_sender, req.response_prelude_sender, resp)
-                    .await
-                    .unwrap();
+            Some(msg) => {
+                match msg {
+                    BussardMessage::Request(mut req) => {
+                        let resp = invoke_app(py, app, req.req);
+                        send_resp(&mut req.body_sender, req.response_prelude_sender, resp)
+                            .await
+                            .unwrap();
+                    }
+                    BussardMessage::Shutdown => {
+                        receiver.close(); // Close the reciver, but wait until we get `None` out to bust out of this loop - might still be queued messages.
+                    }
+                }
             }
             None => {
                 break;
@@ -238,7 +251,7 @@ pub async fn dispatch_req(
     header_map: HeaderMap,
     method: Method,
     body: Bytes,
-    mut sender: mpsc::Sender<AsyncBussardRequest>,
+    mut sender: mpsc::Sender<BussardMessage>,
 ) -> Result<http::Response<hyper::Body>, Rejection> {
     let path = path.as_str().to_owned();
     let req = BussardRequest::new(path, header_map, method, body);
@@ -247,7 +260,7 @@ pub async fn dispatch_req(
     let (response_prelude_sender, response_prelude_reciever) = oneshot::channel::<ResponsePrelude>();
 
     let aync_req = AsyncBussardRequest::new(req, body_sender, response_prelude_sender);
-    sender.send(aync_req).await.unwrap();
+    sender.send(BussardMessage::Request(aync_req)).await.unwrap();
 
     let response_prelude = response_prelude_reciever.await.unwrap();
 

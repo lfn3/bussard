@@ -2,7 +2,7 @@
 
 Bussard is a library that allows you to embed a python WSGI application inside a [warp](https://github.com/seanmonstar/warp) filter.
 
-At the moment it's _very_ crude, and barely works. You should probably not use it. Yet.
+At the moment it's _very_ crude, and barely works. You should probably not use it.
 
 But assuming you are almost as crazy as I am - why would you want to do this? 
 
@@ -23,6 +23,6 @@ Cause I'm a huge nerd, and Bussard Collectors
 ![Enterprise E Bussard Collectors](https://vignette.wikia.nocookie.net/memoryalpha/images/3/3b/Bussard_collector%2C_2367.jpg/revision/latest?cb=20111106181904&path-prefix=en)
 
 are used to provide fuel for the warp cores onboard Federation starships.
-Obviously, this is designed to complement [warp](https://github.com/seanmonstar/warp)
+Which makes sense, this is designed to complement [warp](https://github.com/seanmonstar/warp).
 And it is somewhat analogous to using a python webapp as the reaction mass for one written in rust,
 which is what this was built for.
