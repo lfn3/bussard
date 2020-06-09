@@ -1,7 +1,7 @@
 use bussard::{bussard, dispatch_req, BussardMessage};
 use pyo3::prelude::{PyResult, Python};
 use pyo3::types::PyList;
-use pyo3::{PyAny, PyTryInto};
+use pyo3::{PyTryInto, PyObject};
 use std::env;
 use tokio::sync::mpsc;
 use tokio::{task, join};
@@ -24,13 +24,16 @@ fn add_paths(py: Python) -> PyResult<()> {
     Ok(())
 }
 
-fn flaskapp(py: Python) -> PyResult<&PyAny> {
+fn flaskapp() -> PyResult<PyObject> {
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+
     add_paths(py)?;
 
     let flask_main = py.import("main")?;
     let flask_app = flask_main.get("make_app")?.call0()?;
 
-    Ok(flask_app)
+    Ok(flask_app.into())
 }
 
 fn with<T: Sized + Clone + Send>(
@@ -44,7 +47,8 @@ async fn main() {
     let mut ch = mpsc::channel::<BussardMessage>(1024);
     let receiver = &mut ch.1;
     // We block in place so we don't have to send the python bits
-    let bussard = task::block_in_place(move || bussard(receiver, flaskapp));
+    let app = &flaskapp().unwrap();
+    let bussard = task::block_in_place(move || bussard(receiver, app));
 
     let mut sender = ch.0;
 

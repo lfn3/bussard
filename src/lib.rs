@@ -5,7 +5,7 @@ use pyo3::prelude::{pyclass, pymethods, PyObject, PyResult, Python};
 use pyo3::PyAny;
 use pyo3::{
     types::{IntoPyDict, PyDict, PyString, PyTuple},
-    PyCell, IntoPy,
+    PyCell, IntoPy, AsPyRef,
 };
 use std::{cell::RefCell, collections::HashMap, env, fmt::Debug, rc::Rc, cmp::max};
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +35,7 @@ fn add_per_request_environ<'py>(py: Python<'py>, req: BussardRequest) -> PyResul
     py_env.set_item("wsgi.input", py_req)?;
     py_env.set_item("wsgi.version", PyTuple::new(py, vec![1, 0]))?;
     py_env.set_item("wsgi.run_once", false)?;
+    //TODO: Add wsgi.errors
 
     Ok(py_env)
 }
@@ -159,37 +160,43 @@ pub enum BussardMessage {
     Shutdown
 }
 
-fn invoke_app_py<'a>(
-    py: Python,
-    app: &'a PyAny,
+fn invoke_app_py(
+    app: &PyObject,
     req: BussardRequest,
     sr: StartResponse,
-) -> PyResult<&'a PyAny> {
+) -> PyResult<PyObject> {
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+    
     let full_environ: &PyAny = add_per_request_environ(py, req)?.into();
     let py_sr = PyCell::new(py, sr)?;
     let args = PyTuple::new(py, vec![full_environ, py_sr]);
-    app.call1(args)
+    Ok(app.call1(py, args)?.into())
 }
 
-fn invoke_app<'a>(
-    py: Python,
-    app: &'a PyAny,
+fn invoke_app(
+    app: &PyObject,
     req: BussardRequest,
-) -> PyResult<(&'a PyAny, ResponsePrelude)> {
+) -> PyResult<(PyObject, ResponsePrelude)> {
     let sr = StartResponse::new();
-    let result = invoke_app_py(py, app, req, sr.clone())?;
+    let result = invoke_app_py(app, req, sr.clone())?;
     Ok((result, sr.response_prelude.replace(None).unwrap()))
 }
 
-async fn send_resp<'body_sender>(
+async fn send_resp(
     body_sender: &mut hyper::body::Sender,
     response_prelude_sender: oneshot::Sender<ResponsePrelude>,
-    resp: PyResult<(&PyAny, ResponsePrelude)>,
+    resp: PyResult<(PyObject, ResponsePrelude)>,
 ) -> PyResult<()> {
     let (body, headers) = resp?;
-    let bytes_iter = body.iter()?.map(|b| b.and_then(PyAny::extract::<Vec<u8>>));
+    let gil = Python::acquire_gil();
+    let py = gil.python();
 
-    response_prelude_sender.send(headers).unwrap();
+    // We spend all this time holding the gil, which seems ill advised.
+    let bytes_iter = body.as_ref(py).iter()?.map(|b| b.and_then(PyAny::extract::<Vec<u8>>));
+
+    response_prelude_sender.send(headers).unwrap(); //Sometimes this unwrap is hurling, which it shouldn't be I don't think?
+
     for byte_vec in bytes_iter {
         let bytes = Bytes::from(byte_vec?);
         body_sender.send_data(bytes).await.unwrap()
@@ -198,20 +205,14 @@ async fn send_resp<'body_sender>(
     Ok(())
 }
 
-pub async fn bussard<'body, C>(receiver: &mut mpsc::Receiver<BussardMessage>, app_ctor: C)
-where
-    C: FnOnce(Python) -> PyResult<&PyAny>,
+pub async fn bussard(receiver: &mut mpsc::Receiver<BussardMessage>, app: &PyObject)
 {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
-    let app = app_ctor(py).unwrap();
-
     loop {
         match receiver.recv().await {
             Some(msg) => {
                 match msg {
                     BussardMessage::Request(mut req) => {
-                        let resp = invoke_app(py, app, req.req);
+                        let resp = invoke_app(app, req.req);
                         send_resp(&mut req.body_sender, req.response_prelude_sender, resp)
                             .await
                             .unwrap();
@@ -275,7 +276,7 @@ mod tests {
     use crate::{invoke_app, StartResponse, ResponsePrelude, BussardRequest};
     use http::{HeaderMap, Method};
     use hyper::body::Bytes;
-    use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python};
+    use pyo3::{types::PyList, PyAny, PyResult, PyTryInto, Python, PyObject, AsPyRef};
     use std::{env, str::from_utf8};
 
     fn add_paths(py: Python) -> PyResult<()> {
@@ -294,31 +295,41 @@ mod tests {
         Ok(())
     }
 
-    fn flaskapp(py: Python) -> PyResult<&PyAny> {
+    fn flaskapp() -> PyResult<PyObject> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
         add_paths(py)?;
 
         let flask_main = py.import("main")?;
         let flask_app = flask_main.get("make_app")?.call0()?;
 
-        Ok(flask_app)
+        Ok(flask_app.into())
     }
 
-    #[test]
-    fn test_sync_wsgi() -> PyResult<()> {
+    fn extract_all_bytes(py_iter: PyObject) -> PyResult<Vec<Vec<u8>>> {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let app = flaskapp(py)?;
 
-        let req = BussardRequest::new("".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
-        let (res, response_prelude) = invoke_app(py, app, req)?;
-        assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "13");
-
-        let body: Vec<Vec<u8>> = res
+        let result = py_iter.as_ref(py)
             .iter()?
             .collect::<PyResult<Vec<&PyAny>>>()?
             .into_iter()
             .map(PyAny::extract::<Vec<u8>>)
             .collect::<PyResult<Vec<Vec<u8>>>>()?;
+
+        Ok(result)
+    }
+
+    #[test]
+    fn test_sync_wsgi() -> PyResult<()> {
+        let app = &flaskapp()?;
+        
+        let req = BussardRequest::new("".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
+        let (res, response_prelude) = invoke_app(app, req)?;
+        assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "13");
+
+        let body = extract_all_bytes(res)?;
 
         assert_eq!(body.len(), 1);
 
@@ -330,20 +341,13 @@ mod tests {
 
     #[test]
     fn test_post() -> PyResult<()> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let app = flaskapp(py)?;
+        let app = &flaskapp()?;
 
         let req = BussardRequest::new("/echo".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static("ping".as_bytes()));
-        let (res, response_prelude) = invoke_app(py, app, req)?;
+        let (res, response_prelude) = invoke_app(app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "4");
 
-        let body: Vec<Vec<u8>> = res
-            .iter()?
-            .collect::<PyResult<Vec<&PyAny>>>()?
-            .into_iter()
-            .map(PyAny::extract::<Vec<u8>>)
-            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+        let body = extract_all_bytes(res)?;
 
         assert_eq!(body.len(), 1);
 
@@ -355,21 +359,14 @@ mod tests {
     
     #[test]
     fn test_404() -> PyResult<()> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let app = flaskapp(py)?;
+        let app = &flaskapp()?;
 
         let req = BussardRequest::new("/404".to_owned(), HeaderMap::new(), Method::POST, Bytes::from_static(&[]));
-        let (res, response_prelude) = invoke_app(py, app, req)?;
+        let (res, response_prelude) = invoke_app(app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "232");
         assert_eq!(response_prelude.status_code,  hyper::http::StatusCode::NOT_FOUND);
 
-        let body: Vec<Vec<u8>> = res
-            .iter()?
-            .collect::<PyResult<Vec<&PyAny>>>()?
-            .into_iter()
-            .map(PyAny::extract::<Vec<u8>>)
-            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+        let body = extract_all_bytes(res)?;
 
         assert_eq!(body.len(), 1);
 
@@ -382,21 +379,14 @@ mod tests {
     
     #[test]
     fn test_error() -> PyResult<()> {
-        let gil = Python::acquire_gil();
-        let py = gil.python();
-        let app = flaskapp(py)?;
+        let app = &flaskapp()?;
 
         let req = BussardRequest::new("/throw".to_owned(), HeaderMap::new(), Method::GET, Bytes::from_static(&[]));
-        let (res, response_prelude) = invoke_app(py, app, req)?;
+        let (res, response_prelude) = invoke_app(app, req)?;
         assert_eq!(response_prelude.headers.get("Content-Length").unwrap(), "290");
         assert_eq!(response_prelude.status_code,  hyper::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        let body: Vec<Vec<u8>> = res
-            .iter()?
-            .collect::<PyResult<Vec<&PyAny>>>()?
-            .into_iter()
-            .map(PyAny::extract::<Vec<u8>>)
-            .collect::<PyResult<Vec<Vec<u8>>>>()?;
+        let body = extract_all_bytes(res)?;
 
         assert_eq!(body.len(), 1);
 
